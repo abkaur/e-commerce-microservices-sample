@@ -1,0 +1,99 @@
+pipeline {
+  agent any
+
+  environment {
+    DOCKER_IMAGE = "abkaur95/cart-service:${BUILD_NUMBER}" // ✅ Your DockerHub repo
+    REGISTRY_CREDENTIALS = credentials('dockerhub') // ✅ Saved in Jenkins
+    GCP_CREDENTIALS = credentials('gcp-sa-key') // ✅ JSON key of your GCP service account
+    PROJECT_ID = "your-gcp-project-id"
+    CLUSTER_NAME = "ecommerce-cluster"
+    CLUSTER_ZONE = "us-central1-a"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        echo "Checking out repository..."
+        git branch: 'master', url: 'https://github.com/abkaur/e-commerce-microservices-sample.git'
+        sh 'ls -la cart-cna-microservice'
+      }
+    }
+
+    stage('Build and Test') {
+      steps {
+        sh '''
+        cd cart-cna-microservice
+        ./gradlew clean build
+        '''
+      }
+    }
+
+    stage('Build and Push Docker Image') {
+      steps {
+        script {
+          sh 'cd cart-cna-microservice && docker build -t ${DOCKER_IMAGE} .'
+          def dockerImage = docker.image("${DOCKER_IMAGE}")
+          docker.withRegistry('https://index.docker.io/v1/', "dockerhub") {
+              dockerImage.push()
+          }
+        }
+      }
+    }
+
+    stage('Deploy to GKE') {
+      steps {
+        withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+          sh '''
+            echo "Authenticating to GCP..."
+            gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+            gcloud config set project ${PROJECT_ID}
+            gcloud container clusters get-credentials ${CLUSTER_NAME} --zone ${CLUSTER_ZONE}
+            
+            # Create deployment YAML dynamically
+            cat <<EOF > cart-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: cart
+        image: ${DOCKER_IMAGE}
+        ports:
+        - containerPort: 8080
+EOF
+
+            # Create service if not already created
+            cat <<EOF > cart-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: cart
+  ports:
+  - port: 80
+    targetPort: 8080
+EOF
+
+            kubectl apply -f cart-deployment.yaml
+            kubectl apply -f cart-service.yaml
+          '''
+        }
+      }
+    }
+
+  }
+}
